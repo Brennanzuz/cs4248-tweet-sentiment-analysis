@@ -169,3 +169,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# data 
+data
+
+# models
+models
+*.keras
+catboost_info
