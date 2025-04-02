@@ -173,8 +173,10 @@ cython_debug/
 
 # data 
 data
+*.csv
 
 # models
 models
 *.keras
+*.gz
 catboost_info
