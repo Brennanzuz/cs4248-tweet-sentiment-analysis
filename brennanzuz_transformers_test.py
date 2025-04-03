@@ -61,20 +61,6 @@ if gpus:
         print("Executed on GPU")
 
 # %% [markdown]
-# ## Load and split data
-
-# %%
-train_df = pd.read_csv("data/train_preprocessed.csv", encoding="ISO-8859-1")
-train_set, validation_set = train_test_split(train_df, test_size=0.2, random_state=20250310)
-
-print("Train set size: " + str(len(train_set)))
-train_set.head()
-
-# %%
-print("Validation set size: " + str(len(validation_set)))
-validation_set.head()
-
-# %% [markdown]
 # ## Feature extraction
 
 # %%
@@ -103,24 +89,6 @@ def tokenize_data(texts, max_length=128):
     )
     return encodings['input_ids'], encodings['attention_mask']
 
-# Tokenize train and validation data
-X_train_inputs, X_train_masks = tokenize_data(train_set["lemmatized_sentence"].tolist())
-X_val_inputs, X_val_masks = tokenize_data(validation_set["lemmatized_sentence"].tolist())
-y_train = label_encoder.fit_transform(train_set["sentiment"])
-y_val = label_encoder.transform(validation_set["sentiment"])
-
-# Convert labels to one-hot if needed (depends on your loss function)
-y_train_tf = tf.convert_to_tensor(y_train, dtype=tf.int32)
-y_val_tf = tf.convert_to_tensor(y_val, dtype=tf.int32)
-
-# Create TensorFlow datasets
-batch_size = 16
-train_dataset = tf.data.Dataset.from_tensor_slices(((X_train_inputs, X_train_masks), y_train_tf))
-train_dataset = train_dataset.shuffle(len(y_train)).batch(batch_size)
-
-val_dataset = tf.data.Dataset.from_tensor_slices(((X_val_inputs, X_val_masks), y_val_tf))
-val_dataset = val_dataset.batch(batch_size)
-
 # %% [markdown]
 # ## Transformer model architecture
 
@@ -147,84 +115,6 @@ class TransformerSentimentClassifier(tf_keras.Model):
         
         return logits
 
-model = TransformerSentimentClassifier(model_name=model_name)
-
-# Compile the model
-# Enable mixed precision training
-from tf_keras.mixed_precision import Policy, set_global_policy
-policy = Policy('mixed_float16')
-set_global_policy(policy)
-
-optimizer = tf_keras.optimizers.Adam(learning_rate=2e-5)
-loss = tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-model.compile(
-    optimizer=optimizer,
-    loss=loss,
-    metrics=['accuracy']
-)
-
-# Define a learning rate scheduler (optional)
-class WarmupScheduler(tf_keras.callbacks.Callback):
-    def __init__(self, warmup_steps, total_steps, initial_lr=2e-5, min_lr=0):
-        super(WarmupScheduler, self).__init__()
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.initial_lr = initial_lr
-        self.min_lr = min_lr
-        self.global_step = 0
-        
-    def on_batch_begin(self, batch, logs=None):
-        self.global_step += 1
-        if self.global_step < self.warmup_steps:
-            lr = self.global_step / self.warmup_steps * self.initial_lr
-        else:
-            decay_steps = self.total_steps - self.warmup_steps
-            decay_rate = (self.min_lr - self.initial_lr) / decay_steps
-            lr = self.initial_lr + decay_rate * (self.global_step - self.warmup_steps)
-            lr = max(lr, self.min_lr)
-        
-        tf_keras.backend.set_value(self.model.optimizer.lr, lr)
-
-# Training parameters
-epochs = 3
-steps_per_epoch = len(train_dataset)
-total_steps = steps_per_epoch * epochs
-warmup_steps = int(0.1 * total_steps)  # 10% warmup
-
-# Callbacks
-lr_scheduler = WarmupScheduler(warmup_steps, total_steps)
-early_stopping = tf_keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=2)
-
-# Train the model
-history = model.fit(
-    train_dataset,
-    epochs=epochs,
-    validation_data=val_dataset,
-    callbacks=[lr_scheduler, early_stopping]
-)
-
-# Alternatively, if you prefer a simpler approach without the custom learning rate scheduler:
-# history = model.fit(
-#     train_dataset,
-#     epochs=epochs,
-#     validation_data=val_dataset
-# )
-
-# %% [markdown]
-# ## Saving and loading the model
-
-# %%
-# Save the model after training
-# 1. Save the entire model (including optimizer state)
-model.save_weights('transformer_sentiment_model_weights.h5')
-
-# 2. Save the model architecture as JSON (optional)
-model_json = model.to_json()
-with open("transformer_sentiment_model.json", "w") as json_file:
-    json_file.write(model_json)
-
-print("Model saved successfully")
-
 # Later, to load the model:
 def load_trained_model(model_name="bert-base-uncased", num_classes=3):
     # Recreate the model architecture
@@ -247,17 +137,10 @@ def load_trained_model(model_name="bert-base-uncased", num_classes=3):
     return loaded_model
 
 # Example of loading the model
-# loaded_model = load_trained_model()
-
-# %% [markdown]
-# ## Saving and loading in TensorFlow format
-
-# %%
-# Save the entire model in SavedModel format
-model.save('transformer_sentiment_model_saved', save_format='tf')
+# model = load_trained_model()
 
 # Later, to load:
-loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
+model = tf_keras.models.load_model('transformer_sentiment_model_saved')
 
 # %% [markdown]
 # ## Load test data
