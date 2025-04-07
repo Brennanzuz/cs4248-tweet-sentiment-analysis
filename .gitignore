@@ -176,7 +176,8 @@ data
 *.csv
 
 # models
-models
+model/
+models/
 *.keras
 *.gz
 catboost_info
