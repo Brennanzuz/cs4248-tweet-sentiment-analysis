@@ -14,6 +14,7 @@ from tf_keras.models import Model, Sequential
 from tf_keras.callbacks import EarlyStopping, LearningRateScheduler, ModelCheckpoint
 from tf_keras.utils import to_categorical
 from tf_keras.models import load_model
+import pickle
 
 # from tensorflow.keras.preprocessing.text import Tokenizer
 # from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -25,7 +26,8 @@ from tf_keras.models import load_model
 
 # Load pre-trained embeddings
 import gensim.downloader as api
-glove_vectors = api.load("glove-wiki-gigaword-300")
+glove_vectors = api.load("glove-twitter-200")
+embedding_dim = glove_vectors.vector_size
 
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -78,76 +80,168 @@ validation_set.head()
 # ## Feature extraction
 
 # %%
-# Create tokenizer and model
-model_name = "bert-base-uncased"  # You can use other models like "roberta-base" or "distilbert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-label_encoder = LabelEncoder()
-
-# Tokenize data
-def tokenize_data(texts, max_length=128):
-    # Make sure texts is a list of strings
-    if not isinstance(texts, list):
-        texts = list(texts)
+# Tokenize data and prepare for model input
+def tokenize_data(texts, tokenizer=None, max_length=128):
+    # Create or use tokenizer
+    if tokenizer is None:
+        tokenizer = tf_keras.preprocessing.text.Tokenizer()
+        tokenizer.fit_on_texts(texts)
     
-    # Check for any non-string entries and convert them
-    for i, text in enumerate(texts):
-        if not isinstance(text, str):
-            texts[i] = str(text)
+    # Convert texts to sequences
+    sequences = tokenizer.texts_to_sequences(texts)
     
-    encodings = tokenizer(
-        texts, 
-        padding='max_length',
-        truncation=True,
-        max_length=max_length,
-        return_tensors='tf'
+    # Pad sequences
+    padded_sequences = tf_keras.preprocessing.sequence.pad_sequences(
+        sequences, maxlen=max_length, padding='post'
     )
-    return encodings['input_ids'], encodings['attention_mask']
+    
+    return padded_sequences, tokenizer
 
-# Tokenize train and validation data
-X_train_inputs, X_train_masks = tokenize_data(train_set["lemmatized_sentence"].tolist())
-X_val_inputs, X_val_masks = tokenize_data(validation_set["lemmatized_sentence"].tolist())
+# Create embedding matrix from GloVe
+def create_embedding_matrix(tokenizer, glove_vectors, embedding_dim=200):
+    vocab_size = len(tokenizer.word_index) + 1
+    embedding_matrix = np.zeros((vocab_size, embedding_dim))
+    
+    for word, idx in tokenizer.word_index.items():
+        if word in glove_vectors:
+            embedding_matrix[idx] = glove_vectors[word]
+    
+    return embedding_matrix
+
+# Process the data
+# Hotfix because for some reason the preprocessing didn't ALREADY replace the NaN values
+train_set["lemmatized_sentence"] = train_set["lemmatized_sentence"].fillna("").astype(str)
+validation_set["lemmatized_sentence"] = validation_set["lemmatized_sentence"].fillna("").astype(str)
+
+label_encoder = LabelEncoder()
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(train_set["lemmatized_sentence"].tolist())
+
+# Prepare input sequences
+X_train_seq, _ = tokenize_data(train_set["lemmatized_sentence"].tolist(), tokenizer)
+X_val_seq, _ = tokenize_data(validation_set["lemmatized_sentence"].tolist(), tokenizer)
 y_train = label_encoder.fit_transform(train_set["sentiment"])
 y_val = label_encoder.transform(validation_set["sentiment"])
 
-# Convert labels to one-hot if needed (depends on your loss function)
-y_train_tf = tf.convert_to_tensor(y_train, dtype=tf.int32)
-y_val_tf = tf.convert_to_tensor(y_val, dtype=tf.int32)
+# Create embedding matrix from GloVe
+embedding_matrix = create_embedding_matrix(tokenizer, glove_vectors)
 
-# Create TensorFlow datasets
-batch_size = 16
-train_dataset = tf.data.Dataset.from_tensor_slices(((X_train_inputs, X_train_masks), y_train_tf))
-train_dataset = train_dataset.shuffle(len(y_train)).batch(batch_size)
+# Create datasets
+train_dataset = tf.data.Dataset.from_tensor_slices((X_train_seq, y_train))
+train_dataset = train_dataset.shuffle(len(X_train_seq)).batch(16)
 
-val_dataset = tf.data.Dataset.from_tensor_slices(((X_val_inputs, X_val_masks), y_val_tf))
-val_dataset = val_dataset.batch(batch_size)
+val_dataset = tf.data.Dataset.from_tensor_slices((X_val_seq, y_val))
+val_dataset = val_dataset.batch(16)
 
 # %% [markdown]
 # ## Transformer model architecture
 
 # %%
-# Define a transformer-based model for sentiment analysis using TensorFlow
-class TransformerSentimentClassifier(tf_keras.Model):
-    def __init__(self, model_name="bert-base-uncased", num_classes=3):
-        super(TransformerSentimentClassifier, self).__init__()
-        self.transformer = TFAutoModel.from_pretrained(model_name)
-        self.dropout = tf_keras.layers.Dropout(0.1)
-        self.classifier = tf_keras.layers.Dense(num_classes, activation=None)
+# Define a custom transformer model with GloVe embeddings
+class GloVeTransformerClassifier(tf_keras.Model):
+    def __init__(self, embedding_matrix, max_length=128, num_classes=3, 
+                 num_layers=4, d_model=200, num_heads=8, dff=512, dropout_rate=0.1):
+        super(GloVeTransformerClassifier, self).__init__()
         
+        self.max_length = max_length
+        self.d_model = d_model
+        
+        # GloVe embedding layer (initialized with pretrained weights)
+        vocab_size = embedding_matrix.shape[0]
+        self.embedding = tf_keras.layers.Embedding(
+            vocab_size, d_model,
+            weights=[embedding_matrix],
+            trainable=False  # Freeze the embeddings
+        )
+        
+        # Add positional encoding (required for transformer)
+        self.pos_encoding = self.positional_encoding(max_length, d_model)
+        
+        # Transformer blocks
+        self.transformer_blocks = [
+            TransformerBlock(d_model, num_heads, dff, dropout_rate) 
+            for _ in range(num_layers)
+        ]
+        
+        # Final layers
+        self.dropout = tf_keras.layers.Dropout(dropout_rate)
+        self.pooling = tf_keras.layers.GlobalAveragePooling1D()
+        self.classifier = tf_keras.layers.Dense(num_classes)
+    
+    def positional_encoding(self, position, d_model):
+        # Create positional encodings
+        pos_encoding = np.zeros((position, d_model))
+        for pos in range(position):
+            for i in range(0, d_model, 2):
+                pos_encoding[pos, i] = np.sin(pos / (10000 ** (i / d_model)))
+                if i + 1 < d_model:
+                    pos_encoding[pos, i + 1] = np.cos(pos / (10000 ** (i / d_model)))
+        return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
+    
     def call(self, inputs, training=False):
-        # Get transformer outputs
-        input_ids, attention_mask = inputs
-        outputs = self.transformer.bert(input_ids=input_ids, attention_mask=attention_mask)
+        # inputs shape: (batch_size, seq_len)
+        seq_len = tf.shape(inputs)[1]
         
-        # Use the [CLS] token representation (first token)
-        pooled_output = outputs.last_hidden_state[:, 0, :]
+        # Pass through embedding layer
+        x = self.embedding(inputs)  # (batch_size, seq_len, d_model)
         
-        # Apply dropout and the classification layer
-        x = self.dropout(pooled_output, training=training)
-        logits = self.classifier(x)
+        # Add positional encoding
+        x += self.pos_encoding[:, :seq_len, :]
         
-        return logits
+        # Apply transformer blocks
+        for transformer_block in self.transformer_blocks:
+            x = transformer_block(x, training)
+            
+        # Global average pooling and classification
+        x = self.pooling(x)
+        x = self.dropout(x, training=training)
+        output = self.classifier(x)
+        
+        return output
+    
+# Define a Transformer Block
+class TransformerBlock(tf_keras.layers.Layer):
+    def __init__(self, d_model, num_heads, dff, rate=0.1):
+        super(TransformerBlock, self).__init__()
 
-model = TransformerSentimentClassifier(model_name=model_name)
+        self.mha = tf_keras.layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=d_model//num_heads)
+        self.ffn = self.point_wise_feed_forward_network(d_model, dff)
+
+        self.layernorm1 = tf_keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf_keras.layers.LayerNormalization(epsilon=1e-6)
+
+        self.dropout1 = tf_keras.layers.Dropout(rate)
+        self.dropout2 = tf_keras.layers.Dropout(rate)
+
+    def point_wise_feed_forward_network(self, d_model, dff):
+        return tf_keras.Sequential([
+            tf_keras.layers.Dense(dff, activation='relu'),
+            tf_keras.layers.Dense(d_model)
+        ])
+
+    def call(self, x, training):
+        # Multi-head attention
+        attn_output = self.mha(x, x, x)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)  # Residual connection
+        
+        # Feed-forward network
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = self.layernorm2(out1 + ffn_output)  # Residual connection
+        
+        return out2
+    
+# Create model
+model = GloVeTransformerClassifier(
+    embedding_matrix=embedding_matrix,
+    max_length=128,
+    num_classes=3,
+    num_layers=4,  # Number of transformer layers
+    d_model=200,   # Dimension of GloVe embeddings
+    num_heads=8    # Number of attention heads
+)
 
 # Compile the model
 # Enable mixed precision training
@@ -155,13 +249,10 @@ from tf_keras.mixed_precision import Policy, set_global_policy
 policy = Policy('mixed_float16')
 set_global_policy(policy)
 
-optimizer = tf_keras.optimizers.Adam(learning_rate=2e-5)
+# Compile model
+optimizer = tf_keras.optimizers.Adam(learning_rate=1e-4)
 loss = tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-model.compile(
-    optimizer=optimizer,
-    loss=loss,
-    metrics=['accuracy']
-)
+model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
 
 # Define a learning rate scheduler (optional)
 class WarmupScheduler(tf_keras.callbacks.Callback):
@@ -185,22 +276,14 @@ class WarmupScheduler(tf_keras.callbacks.Callback):
         
         tf_keras.backend.set_value(self.model.optimizer.lr, lr)
 
-# Training parameters
-epochs = 3
-steps_per_epoch = len(train_dataset)
-total_steps = steps_per_epoch * epochs
-warmup_steps = int(0.1 * total_steps)  # 10% warmup
-
-# Callbacks
-lr_scheduler = WarmupScheduler(warmup_steps, total_steps)
-early_stopping = tf_keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=2)
-
 # Train the model
+epochs = 3
+early_stopping = tf_keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=2)
 history = model.fit(
     train_dataset,
     epochs=epochs,
     validation_data=val_dataset,
-    callbacks=[lr_scheduler, early_stopping]
+    callbacks=[early_stopping]
 )
 
 # Alternatively, if you prefer a simpler approach without the custom learning rate scheduler:
@@ -216,38 +299,93 @@ history = model.fit(
 # %%
 # Save the model after training
 # 1. Save the entire model (including optimizer state)
-model.save_weights('transformer_sentiment_model_weights.h5')
+model.save_weights('glove_transformer_sentiment_model_weights.h5')
 
-# 2. Save the model architecture as JSON (optional)
-model_json = model.to_json()
-with open("transformer_sentiment_model.json", "w") as json_file:
-    json_file.write(model_json)
+# 2. Save the tokenizer vocabulary (critical for recreating embedding matrix)
+with open('glove_tokenizer.pickle', 'wb') as handle:
+    pickle.dump(tokenizer, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+# 3. Save hyperparameters (optional but helpful)
+model_params = {
+    'max_length': 128,
+    'num_classes': 3,
+    'num_layers': 4,
+    'd_model': 200,
+    'num_heads': 8,
+    'dff': 512,
+    'dropout_rate': 0.1
+}
+
+with open('glove_model_params.pickle', 'wb') as handle:
+    pickle.dump(model_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 print("Model saved successfully")
 
 # Later, to load the model:
-def load_trained_model(model_name="bert-base-uncased", num_classes=3):
-    # Recreate the model architecture
-    loaded_model = TransformerSentimentClassifier(model_name=model_name, num_classes=num_classes)
+def load_trained_glove_model(glove_vectors_path="glove-twitter-200"):
+    # 1. Load the tokenizer
+    with open('glove_tokenizer.pickle', 'rb') as handle:
+        tokenizer = pickle.load(handle)
     
-    # Compile the model to initialize weights
+    # 2. Load model parameters
+    with open('glove_model_params.pickle', 'rb') as handle:
+        model_params = pickle.load(handle)
+    
+    # 3. Load GloVe vectors
+    import gensim.downloader as api
+    glove_vectors = api.load(glove_vectors_path)
+    
+    # 4. Recreate the embedding matrix
+    embedding_matrix = create_embedding_matrix(tokenizer, glove_vectors, embedding_dim=model_params['d_model'])
+    
+    # 5. Recreate the model architecture
+    loaded_model = GloVeTransformerClassifier(
+        embedding_matrix=embedding_matrix,
+        max_length=model_params['max_length'],
+        num_classes=model_params['num_classes'],
+        num_layers=model_params['num_layers'],
+        d_model=model_params['d_model'],
+        num_heads=model_params['num_heads'],
+        dff=model_params.get('dff', 512),
+        dropout_rate=model_params.get('dropout_rate', 0.1)
+    )
+    
+    # 6. Compile the model to initialize weights
     loaded_model.compile(
         optimizer=tf_keras.optimizers.Adam(),
         loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=['accuracy']
     )
     
-    # Build the model with a sample input
-    sample_input_ids = tf.ones((1, 128), dtype=tf.int32)
-    sample_masks = tf.ones((1, 128), dtype=tf.int32)
-    _ = loaded_model([sample_input_ids, sample_masks])
+    # 7. Build the model with a sample input (single tensor, not tuple like BERT)
+    sample_input = tf.ones((1, model_params['max_length']), dtype=tf.int32)
+    _ = loaded_model(sample_input)
     
-    # Load the weights
-    loaded_model.load_weights('transformer_sentiment_model_weights.h5')
-    return loaded_model
+    # 8. Load the weights
+    loaded_model.load_weights('glove_transformer_sentiment_model_weights.h5')
+    
+    return loaded_model, tokenizer
 
-# Example of loading the model
-# loaded_model = load_trained_model()
+# Example of loading and using the model:
+# loaded_model, loaded_tokenizer = load_trained_glove_model()
+# 
+# # Process new text
+# def predict_sentiment(text, model, tokenizer, max_length=128):
+#     # Preprocess text (similar to your training preprocessing)
+#     # ... your preprocessing steps here ...
+#     
+#     # Tokenize
+#     sequences = tokenizer.texts_to_sequences([text])
+#     padded = tf_keras.preprocessing.sequence.pad_sequences(sequences, maxlen=max_length)
+#     
+#     # Predict
+#     logits = model(padded)
+#     probabilities = tf.nn.softmax(logits, axis=-1)
+#     predicted_class = tf.argmax(probabilities, axis=-1)
+#     
+#     # Map class index to label (depends on your label encoding)
+#     labels = ['negative', 'neutral', 'positive']  # Adjust based on your encoding
+#     return labels[predicted_class[0]]
 
 # %% [markdown]
 # ## Saving and loading in TensorFlow format
@@ -257,7 +395,9 @@ def load_trained_model(model_name="bert-base-uncased", num_classes=3):
 model.save('transformer_sentiment_model_saved', save_format='tf')
 
 # Later, to load:
-loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
+loaded_model = tf_keras.models.load_model("transformer_sentiment_model_saved")
+with open('glove_tokenizer.pickle', 'rb') as handle:
+    loaded_tokenizer = pickle.load(handle)
 
 # %% [markdown]
 # ## Load test data
@@ -266,7 +406,7 @@ loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
 test_df = pd.read_csv("data/test_preprocessed.csv")
 print("Test set size: " + str(len(test_df)))
 
-X_test_inputs, X_test_masks = tokenize_data(test_df["lemmatized_sentence"].tolist())
+X_test_seq, _ = tokenize_data(test_df["lemmatized_sentence"].tolist(), tokenizer)
 
 # %% [markdown]
 # ## Evaluate models
@@ -279,16 +419,29 @@ reverse_label_map = {
 }
 
 # Make predictions
-predictions = model.predict((X_test_inputs, X_test_masks))
+predictions = model.predict(X_test_seq)
 predictions = np.argmax(predictions, axis=1)
 mapped_predictions = np.array([reverse_label_map[prediction] for prediction in predictions])
 
 test_df["predicted_sentiment"] = mapped_predictions
-test_df.to_csv("data/tree_model_predictions.csv", index=False)
+test_df.to_csv("data/test_predictions_glove.csv", index=False)
 
 test_df.head()
 
 # %%
-print(classification_report(test_df["sentiment"], test_df["predicted_sentiment"]))
+# Show sample predictions
+print("\nSample predictions:")
+sample_results = test_df[["lemmatized_sentence", "predicted_sentiment"]].head(10)
+for i, row in sample_results.iterrows():
+    print(f"Text: {row['lemmatized_sentence'][:50]}{'...' if len(row['lemmatized_sentence']) > 50 else ''}")
+    print(f"Predicted sentiment: {row['predicted_sentiment']}\n")
 
+# Calculate class distribution in predictions
+sentiment_counts = test_df["predicted_sentiment"].value_counts()
+print("\nPredicted sentiment distribution:")
+print(sentiment_counts)
+print(f"Negative: {sentiment_counts.get('negative', 0) / len(test_df):.2%}")
+print(f"Neutral: {sentiment_counts.get('neutral', 0) / len(test_df):.2%}")
+print(f"Positive: {sentiment_counts.get('positive', 0) / len(test_df):.2%}")
+print(classification_report(test_df["sentiment"], test_df["predicted_sentiment"]))
 
