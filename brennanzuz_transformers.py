@@ -79,7 +79,7 @@ validation_set.head()
 
 # %%
 # Create tokenizer and model
-model_name = "bert-base-uncased"  # You can use other models like "roberta-base" or "distilbert-base-uncased"
+model_name = "roberta-base"  # You can use other models like "roberta-base" or "distilbert-base-uncased"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 label_encoder = LabelEncoder()
 
@@ -127,7 +127,7 @@ val_dataset = val_dataset.batch(batch_size)
 # %%
 # Define a transformer-based model for sentiment analysis using TensorFlow
 class TransformerSentimentClassifier(tf_keras.Model):
-    def __init__(self, model_name="bert-base-uncased", num_classes=3):
+    def __init__(self, model_name, num_classes=3):
         super(TransformerSentimentClassifier, self).__init__()
         self.transformer = TFAutoModel.from_pretrained(model_name)
         self.dropout = tf_keras.layers.Dropout(0.1)
@@ -136,7 +136,7 @@ class TransformerSentimentClassifier(tf_keras.Model):
     def call(self, inputs, training=False):
         # Get transformer outputs
         input_ids, attention_mask = inputs
-        outputs = self.transformer.bert(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
         
         # Use the [CLS] token representation (first token)
         pooled_output = outputs.last_hidden_state[:, 0, :]
@@ -147,7 +147,7 @@ class TransformerSentimentClassifier(tf_keras.Model):
         
         return logits
 
-model = TransformerSentimentClassifier(model_name=model_name)
+model = TransformerSentimentClassifier(model_name)
 
 # Compile the model
 # Enable mixed precision training
@@ -163,28 +163,6 @@ model.compile(
     metrics=['accuracy']
 )
 
-# Define a learning rate scheduler (optional)
-class WarmupScheduler(tf_keras.callbacks.Callback):
-    def __init__(self, warmup_steps, total_steps, initial_lr=2e-5, min_lr=0):
-        super(WarmupScheduler, self).__init__()
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.initial_lr = initial_lr
-        self.min_lr = min_lr
-        self.global_step = 0
-        
-    def on_batch_begin(self, batch, logs=None):
-        self.global_step += 1
-        if self.global_step < self.warmup_steps:
-            lr = self.global_step / self.warmup_steps * self.initial_lr
-        else:
-            decay_steps = self.total_steps - self.warmup_steps
-            decay_rate = (self.min_lr - self.initial_lr) / decay_steps
-            lr = self.initial_lr + decay_rate * (self.global_step - self.warmup_steps)
-            lr = max(lr, self.min_lr)
-        
-        tf_keras.backend.set_value(self.model.optimizer.lr, lr)
-
 # Training parameters
 epochs = 3
 steps_per_epoch = len(train_dataset)
@@ -192,7 +170,9 @@ total_steps = steps_per_epoch * epochs
 warmup_steps = int(0.1 * total_steps)  # 10% warmup
 
 # Callbacks
-lr_scheduler = WarmupScheduler(warmup_steps, total_steps)
+lr_scheduler = tf_keras.callbacks.LearningRateScheduler(
+    lambda epoch: optimizer.learning_rate * (epoch / warmup_steps) if epoch < warmup_steps else optimizer.learning_rate
+)
 early_stopping = tf_keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=2)
 
 # Train the model
@@ -226,7 +206,7 @@ with open("transformer_sentiment_model.json", "w") as json_file:
 print("Model saved successfully")
 
 # Later, to load the model:
-def load_trained_model(model_name="bert-base-uncased", num_classes=3):
+def load_trained_model(model_name, num_classes=3):
     # Recreate the model architecture
     loaded_model = TransformerSentimentClassifier(model_name=model_name, num_classes=num_classes)
     
@@ -257,7 +237,7 @@ def load_trained_model(model_name="bert-base-uncased", num_classes=3):
 model.save('transformer_sentiment_model_saved', save_format='tf')
 
 # Later, to load:
-loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
+# loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
 
 # %% [markdown]
 # ## Load test data
@@ -284,7 +264,7 @@ predictions = np.argmax(predictions, axis=1)
 mapped_predictions = np.array([reverse_label_map[prediction] for prediction in predictions])
 
 test_df["predicted_sentiment"] = mapped_predictions
-test_df.to_csv("data/tree_model_predictions.csv", index=False)
+test_df.to_csv("data/test_predictions.csv", index=False)
 
 test_df.head()
 
