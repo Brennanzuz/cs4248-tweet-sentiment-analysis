@@ -163,6 +163,27 @@ model.compile(
     metrics=['accuracy']
 )
 
+class WarmupScheduler(tf_keras.callbacks.Callback):
+    def __init__(self, warmup_steps, total_steps, initial_lr=2e-5, min_lr=0):
+        super(WarmupScheduler, self).__init__()
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.initial_lr = initial_lr
+        self.min_lr = min_lr
+        self.global_step = 0
+        
+    def on_batch_begin(self, batch, logs=None):
+        self.global_step += 1
+        if self.global_step < self.warmup_steps:
+            lr = self.global_step / self.warmup_steps * self.initial_lr
+        else:
+            decay_steps = self.total_steps - self.warmup_steps
+            decay_rate = (self.min_lr - self.initial_lr) / decay_steps
+            lr = self.initial_lr + decay_rate * (self.global_step - self.warmup_steps)
+            lr = max(lr, self.min_lr)
+        
+        tf_keras.backend.set_value(self.model.optimizer.lr, lr)
+
 # Training parameters
 epochs = 3
 steps_per_epoch = len(train_dataset)
@@ -170,9 +191,7 @@ total_steps = steps_per_epoch * epochs
 warmup_steps = int(0.1 * total_steps)  # 10% warmup
 
 # Callbacks
-lr_scheduler = tf_keras.callbacks.LearningRateScheduler(
-    lambda epoch: optimizer.learning_rate * (epoch / warmup_steps) if epoch < warmup_steps else optimizer.learning_rate
-)
+lr_scheduler = WarmupScheduler(warmup_steps, total_steps)
 early_stopping = tf_keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=2)
 
 # Train the model
