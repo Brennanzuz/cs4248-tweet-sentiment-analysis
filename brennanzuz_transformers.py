@@ -137,110 +137,47 @@ val_dataset = val_dataset.batch(16)
 # ## Transformer model architecture
 
 # %%
-# Define a custom transformer model with GloVe embeddings
-class GloVeTransformerClassifier(tf_keras.Model):
-    def __init__(self, embedding_matrix, max_length=128, num_classes=3, 
-                 num_layers=4, d_model=200, num_heads=8, dff=512, dropout_rate=0.1):
-        super(GloVeTransformerClassifier, self).__init__()
+# Static GloVe Classifier - No contextual processing
+class StaticGloVeClassifier(tf_keras.Model):
+    def __init__(self, embedding_matrix, max_length=128, num_classes=3, dropout_rate=0.1):
+        super(StaticGloVeClassifier, self).__init__()
         
-        self.max_length = max_length
-        self.d_model = d_model
+        vocab_size = embedding_matrix.shape[0]
+        d_model = embedding_matrix.shape[1]  # Should be 200 for glove-twitter-200
         
         # GloVe embedding layer (initialized with pretrained weights)
-        vocab_size = embedding_matrix.shape[0]
         self.embedding = tf_keras.layers.Embedding(
             vocab_size, d_model,
             weights=[embedding_matrix],
-            trainable=False  # Freeze the embeddings
+            trainable=False  # Keep truly static - no fine-tuning
         )
         
-        # Add positional encoding (required for transformer)
-        self.pos_encoding = self.positional_encoding(max_length, d_model)
-        
-        # Transformer blocks
-        self.transformer_blocks = [
-            TransformerBlock(d_model, num_heads, dff, dropout_rate) 
-            for _ in range(num_layers)
-        ]
-        
-        # Final layers
-        self.dropout = tf_keras.layers.Dropout(dropout_rate)
+        # Simple feed-forward classifier on top of static embeddings
+        # Approach 1: Global Average Pooling (average word vectors)
         self.pooling = tf_keras.layers.GlobalAveragePooling1D()
+        self.dense1 = tf_keras.layers.Dense(128, activation='relu')
+        self.dropout = tf_keras.layers.Dropout(dropout_rate)
         self.classifier = tf_keras.layers.Dense(num_classes)
-    
-    def positional_encoding(self, position, d_model):
-        # Create positional encodings
-        pos_encoding = np.zeros((position, d_model))
-        for pos in range(position):
-            for i in range(0, d_model, 2):
-                pos_encoding[pos, i] = np.sin(pos / (10000 ** (i / d_model)))
-                if i + 1 < d_model:
-                    pos_encoding[pos, i + 1] = np.cos(pos / (10000 ** (i / d_model)))
-        return tf.cast(pos_encoding[np.newaxis, ...], dtype=tf.float32)
-    
-    def call(self, inputs, training=False):
-        # inputs shape: (batch_size, seq_len)
-        seq_len = tf.shape(inputs)[1]
         
-        # Pass through embedding layer
+    def call(self, inputs, training=False):
+        # Get embeddings
         x = self.embedding(inputs)  # (batch_size, seq_len, d_model)
         
-        # Add positional encoding
-        x += self.pos_encoding[:, :seq_len, :]
-        
-        # Apply transformer blocks
-        for transformer_block in self.transformer_blocks:
-            x = transformer_block(x, training)
-            
-        # Global average pooling and classification
+        # Global average pooling (average of all word vectors in tweet)
         x = self.pooling(x)
+        
+        # Classification head
+        x = self.dense1(x)
         x = self.dropout(x, training=training)
         output = self.classifier(x)
         
         return output
     
-# Define a Transformer Block
-class TransformerBlock(tf_keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
-        super(TransformerBlock, self).__init__()
-
-        self.mha = tf_keras.layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=d_model//num_heads)
-        self.ffn = self.point_wise_feed_forward_network(d_model, dff)
-
-        self.layernorm1 = tf_keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf_keras.layers.LayerNormalization(epsilon=1e-6)
-
-        self.dropout1 = tf_keras.layers.Dropout(rate)
-        self.dropout2 = tf_keras.layers.Dropout(rate)
-
-    def point_wise_feed_forward_network(self, d_model, dff):
-        return tf_keras.Sequential([
-            tf_keras.layers.Dense(dff, activation='relu'),
-            tf_keras.layers.Dense(d_model)
-        ])
-
-    def call(self, x, training):
-        # Multi-head attention
-        attn_output = self.mha(x, x, x)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)  # Residual connection
-        
-        # Feed-forward network
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(out1 + ffn_output)  # Residual connection
-        
-        return out2
-    
-# Create model
-model = GloVeTransformerClassifier(
+# Create static GloVe model
+model = StaticGloVeClassifier(
     embedding_matrix=embedding_matrix,
     max_length=128,
-    num_classes=3,
-    num_layers=4,  # Number of transformer layers
-    d_model=200,   # Dimension of GloVe embeddings
-    num_heads=8    # Number of attention heads
+    num_classes=3
 )
 
 # Compile the model
@@ -444,4 +381,5 @@ print(f"Negative: {sentiment_counts.get('negative', 0) / len(test_df):.2%}")
 print(f"Neutral: {sentiment_counts.get('neutral', 0) / len(test_df):.2%}")
 print(f"Positive: {sentiment_counts.get('positive', 0) / len(test_df):.2%}")
 print(classification_report(test_df["sentiment"], test_df["predicted_sentiment"]))
+
 
