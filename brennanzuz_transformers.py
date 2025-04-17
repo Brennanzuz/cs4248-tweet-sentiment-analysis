@@ -80,12 +80,16 @@ validation_set.head()
 # ## Feature extraction
 
 # %%
-# Tokenize data and prepare for model input
-def tokenize_data(texts, tokenizer=None, max_length=128):
-    # Create or use tokenizer
-    if tokenizer is None:
-        tokenizer = tf_keras.preprocessing.text.Tokenizer()
-        tokenizer.fit_on_texts(texts)
+# Create tokenizer and model
+model_name = "roberta-base"  # You can use other models like "roberta-base" or "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+label_encoder = LabelEncoder()
+
+# Tokenize data
+def tokenize_data(texts, max_length=128):
+    # Make sure texts is a list of strings
+    if not isinstance(texts, list):
+        texts = list(texts)
     
     # Convert texts to sequences
     sequences = tokenizer.texts_to_sequences(texts)
@@ -137,31 +141,18 @@ val_dataset = val_dataset.batch(16)
 # ## Transformer model architecture
 
 # %%
-# Static GloVe Classifier - No contextual processing
-class StaticGloVeClassifier(tf_keras.Model):
-    def __init__(self, embedding_matrix, max_length=128, num_classes=3, dropout_rate=0.1):
-        super(StaticGloVeClassifier, self).__init__()
-        
-        vocab_size = embedding_matrix.shape[0]
-        d_model = embedding_matrix.shape[1]  # Should be 200 for glove-twitter-200
-        
-        # GloVe embedding layer (initialized with pretrained weights)
-        self.embedding = tf_keras.layers.Embedding(
-            vocab_size, d_model,
-            weights=[embedding_matrix],
-            trainable=False  # Keep truly static - no fine-tuning
-        )
-        
-        # Simple feed-forward classifier on top of static embeddings
-        # Approach 1: Global Average Pooling (average word vectors)
-        self.pooling = tf_keras.layers.GlobalAveragePooling1D()
-        self.dense1 = tf_keras.layers.Dense(128, activation='relu')
-        self.dropout = tf_keras.layers.Dropout(dropout_rate)
-        self.classifier = tf_keras.layers.Dense(num_classes)
+# Define a transformer-based model for sentiment analysis using TensorFlow
+class TransformerSentimentClassifier(tf_keras.Model):
+    def __init__(self, model_name, num_classes=3):
+        super(TransformerSentimentClassifier, self).__init__()
+        self.transformer = TFAutoModel.from_pretrained(model_name)
+        self.dropout = tf_keras.layers.Dropout(0.1)
+        self.classifier = tf_keras.layers.Dense(num_classes, activation=None)
         
     def call(self, inputs, training=False):
-        # Get embeddings
-        x = self.embedding(inputs)  # (batch_size, seq_len, d_model)
+        # Get transformer outputs
+        input_ids, attention_mask = inputs
+        outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)
         
         # Global average pooling (average of all word vectors in tweet)
         x = self.pooling(x)
@@ -171,14 +162,9 @@ class StaticGloVeClassifier(tf_keras.Model):
         x = self.dropout(x, training=training)
         output = self.classifier(x)
         
-        return output
-    
-# Create static GloVe model
-model = StaticGloVeClassifier(
-    embedding_matrix=embedding_matrix,
-    max_length=128,
-    num_classes=3
-)
+        return logits
+
+model = TransformerSentimentClassifier(model_name)
 
 # Compile the model
 # Enable mixed precision training
@@ -191,7 +177,6 @@ optimizer = tf_keras.optimizers.Adam(learning_rate=1e-4)
 loss = tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 model.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
 
-# Define a learning rate scheduler (optional)
 class WarmupScheduler(tf_keras.callbacks.Callback):
     def __init__(self, warmup_steps, total_steps, initial_lr=2e-5, min_lr=0):
         super(WarmupScheduler, self).__init__()
@@ -259,10 +244,9 @@ with open('glove_model_params.pickle', 'wb') as handle:
 print("Model saved successfully")
 
 # Later, to load the model:
-def load_trained_glove_model(glove_vectors_path="glove-twitter-200"):
-    # 1. Load the tokenizer
-    with open('glove_tokenizer.pickle', 'rb') as handle:
-        tokenizer = pickle.load(handle)
+def load_trained_model(model_name, num_classes=3):
+    # Recreate the model architecture
+    loaded_model = TransformerSentimentClassifier(model_name=model_name, num_classes=num_classes)
     
     # 2. Load model parameters
     with open('glove_model_params.pickle', 'rb') as handle:
@@ -332,9 +316,7 @@ def load_trained_glove_model(glove_vectors_path="glove-twitter-200"):
 model.save('transformer_sentiment_model_saved', save_format='tf')
 
 # Later, to load:
-loaded_model = tf_keras.models.load_model("transformer_sentiment_model_saved")
-with open('glove_tokenizer.pickle', 'rb') as handle:
-    loaded_tokenizer = pickle.load(handle)
+# loaded_model = tf_keras.models.load_model('transformer_sentiment_model_saved')
 
 # %% [markdown]
 # ## Load test data
@@ -361,7 +343,7 @@ predictions = np.argmax(predictions, axis=1)
 mapped_predictions = np.array([reverse_label_map[prediction] for prediction in predictions])
 
 test_df["predicted_sentiment"] = mapped_predictions
-test_df.to_csv("data/test_predictions_glove.csv", index=False)
+test_df.to_csv("data/test_predictions.csv", index=False)
 
 test_df.head()
 
